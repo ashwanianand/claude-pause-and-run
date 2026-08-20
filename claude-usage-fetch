@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# claude-usage-fetch — print the Claude usage API's raw JSON on stdout.
+#
+# Used by claude-usage-guard as its default data source. Reads the OAuth
+# access token from the local Claude Code credentials file (the same file the
+# CLI itself uses) and calls the usage endpoint. Prints nothing and exits
+# non-zero on any failure, so the guard treats it as "usage unknown" and
+# fails open.
+set -u
+
+CRED="${CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+[ -r "$CRED" ] || exit 1
+
+TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED" 2>/dev/null)
+[ -n "$TOKEN" ] || exit 1
+
+curl -fsS --max-time 10 https://api.anthropic.com/api/oauth/usage \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "anthropic-beta: oauth-2025-04-20" || exit 1

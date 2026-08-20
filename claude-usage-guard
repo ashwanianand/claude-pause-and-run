@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# claude-usage-guard — pause/resume harness for Claude Code, driven by usage limits.
+#
+# Data source: the `claude-usage-fetch` helper installed alongside this
+# script reads https://api.anthropic.com/api/oauth/usage; results are cached
+# for 5 minutes in $XDG_RUNTIME_DIR/claude-usage-guard/usage.json. Override
+# the fetcher with $CUG_FETCH (any program that prints that API's JSON).
+#
+# Subcommands
+#   state [--fresh]         print normalized usage JSON (cached)
+#   status                  human-readable summary + active grants
+#   grant [--level 2] <session_id>
+#                           record the user's permission to keep spending the
+#                           WEEKLY budget (the PreToolUse hook shows the user a
+#                           permission prompt when the agent runs this)
+#   revoke <session_id>     delete the weekly grant for a session
+#   wait <five|week> [session_id]
+#                           block until the limit resets (or, for week, until a
+#                           sufficient grant appears); fallback for manual use —
+#                           the Stop hook normally starts the waiter itself
+#   hook <pre|post|sessionstart|stop>
+#                           Claude Code hook entrypoints (hook JSON on stdin)
+#
+# Thresholds
+#   5-hour : warn 80%, pause 90%, hard tool-block 95%. Never asks the user;
+#            auto-resumes when the window resets.
+#   weekly : ask the user at 80%, hard block 85% without a grant;
+#            ask again (level 2) at 95%, hard block 97% without level 2.
+#
+# Design notes
+#   - Fail open: if usage cannot be determined, hooks stay silent (exit 0).
+#   - State in $XDG_RUNTIME_DIR/claude-usage-guard (per login). Grants store
+#     the weekly reset timestamp, so they expire when the window rolls over.
+#   - No external timers: the Stop hook (asyncRewake) waits in the background
+#     of the live session and wakes the agent; a closed session stays closed.
+
+set -u
+
+if   [ -n "${CUG_FETCH:-}" ];                       then FETCH="$CUG_FETCH"
+elif command -v claude-usage-fetch >/dev/null 2>&1; then FETCH="$(command -v claude-usage-fetch)"
+else FETCH="$HOME/.local/bin/claude-usage-fetch"; fi
+RUN="${CUG_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-usage-guard}"
+CACHE="$RUN/usage.json"
+LOCK="$RUN/lock"
+TTL="${CUG_TTL:-300}"
+
+# Portability: macOS/BSD have different date/stat and ship no flock or timeout.
+# Detect once; the helpers below branch on these. CUG_NO_FLOCK forces the
+# lock fallback path (for tests).
+if date --version >/dev/null 2>&1; then DATE_KIND=gnu; else DATE_KIND=bsd; fi
+if stat -c %Y . >/dev/null 2>&1; then STAT_MTIME=c; else STAT_MTIME=f; fi
+if command -v flock >/dev/null 2>&1 && [ -z "${CUG_NO_FLOCK:-}" ]; then HAVE_FLOCK=1; else HAVE_FLOCK=0; fi
+if [ -n "${CUG_NO_TIMEOUT:-}" ]; then TIMEOUT_BIN=""   # force watchdog fallback (tests)
+else TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"; fi
+
+FIVE_WARN=80; FIVE_PAUSE=90; FIVE_HARD=95
+WEEK_ASK=80;  WEEK_HARD=85;  WEEK_ASK2=95; WEEK_HARD2=97
+
+GUARD_SUB=""
+mkdir -p "$RUN/sessions"
+
+# ---------------------------------------------------------------- helpers
+
+_bsd_norm() {  # ISO8601 -> "YYYY-MM-DDTHH:MM:SS+HHMM" (drop fractional secs, ':' in tz)
+  local in="$1" tz rest
+  case "$in" in
+    *Z|*z) tz="+0000"; rest="${in%?}";;
+    *[+-][0-9][0-9]:[0-9][0-9]) tz="${in: -6}"; tz="${tz/:/}"; rest="${in%??????}";;
+    *[+-][0-9][0-9][0-9][0-9]) tz="${in: -5}"; rest="${in%?????}";;
+    *) tz="+0000"; rest="$in";;
+  esac
+  printf '%s%s' "${rest%%.*}" "$tz"
+}
+
+epoch() {  # ISO8601 timestamp -> epoch seconds (GNU date -d, or BSD date -j -f)
+  [ -n "${1:-}" ] || return 1
+  if [ "$DATE_KIND" = gnu ]; then
+    date -d "$1" +%s 2>/dev/null
+  else
+    date -j -f "%Y-%m-%dT%H:%M:%S%z" "$(_bsd_norm "$1")" +%s 2>/dev/null
+  fi
+}
+
+mtime() {  # file mtime in epoch seconds, or 0 (GNU stat -c, or BSD stat -f)
+  if [ "$STAT_MTIME" = c ]; then stat -c %Y "$1" 2>/dev/null || echo 0
+  else stat -f %m "$1" 2>/dev/null || echo 0; fi
+}
+
+run_fetch() {  # run "$FETCH" with a ~10s cap, portably (no coreutils timeout needed)
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" 10 bash "$FETCH" 2>/dev/null
+    return
+  fi
+  local p w rc
+  bash "$FETCH" 2>/dev/null &
+  p=$!
+  ( sleep 10; kill -TERM "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null; rc=$?
+  kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return "$rc"
+}
+
+until_str() {  # human "2d 4h 10m" until ISO timestamp $1
+  local t rem d h m
+  t=$(epoch "${1:-}") || { printf 'unknown'; return; }
+  rem=$(( t - $(date +%s) ))
+  [ "$rem" -le 0 ] && { printf 'now'; return; }
+  d=$((rem/86400)); h=$((rem%86400/3600)); m=$((rem%3600/60))
+  if [ "$d" -gt 0 ]; then printf '%dd %dh %dm' "$d" "$h" "$m"
+  else printf '%dh %dm' "$h" "$m"; fi
+}
+
+sanitize_sid() {
+  local s
+  s=$(printf '%s' "${1:-}" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
+  case "$s" in *[!.]*) printf '%s' "$s";; *) printf '';; esac  # all-dots -> empty
+}
+
+_state_refresh() {  # recheck age, fetch, cache atomically, print; $1 = fresh flag
+  local fresh="${1:-}" now age raw norm
+  now=$(date +%s)
+  if [ "$fresh" != "--fresh" ] && [ -f "$CACHE" ]; then
+    age=$(( now - $(mtime "$CACHE") ))
+    [ "$age" -lt "$TTL" ] && { cat "$CACHE"; return; }
+  fi
+  raw=$(run_fetch)
+  norm=$(printf '%s' "$raw" | jq -c '
+    def pct(x): if (x|type)=="number" then (x|floor) else null end;
+    { five_pct: pct(.five_hour.utilization),
+      five_resets: (.five_hour.resets_at // null),
+      week_pct: pct(.seven_day.utilization),
+      week_resets: (.seven_day.resets_at // null) }' 2>/dev/null)
+  if [ -n "$norm" ] && printf '%s' "$norm" \
+      | jq -e '(.five_pct|type=="number") and (.week_pct|type=="number")' >/dev/null 2>&1; then
+    printf '%s\n' "$norm" > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
+  fi
+  cat "$CACHE" 2>/dev/null   # stale-if-error: old data beats none
+}
+
+cmd_state() {  # normalized JSON: {five_pct, five_resets, week_pct, week_resets}
+  if [ -n "${CUG_USAGE_FAKE:-}" ]; then cat "$CUG_USAGE_FAKE" 2>/dev/null; return; fi
+  local fresh="${1:-}" age
+  if [ "$fresh" != "--fresh" ] && [ -f "$CACHE" ]; then
+    age=$(( $(date +%s) - $(mtime "$CACHE") ))
+    [ "$age" -lt "$TTL" ] && { cat "$CACHE"; return; }
+  fi
+  # flock serializes concurrent refreshes so they don't all hit the API; where
+  # flock is unavailable (macOS) we skip it — the atomic tmp+mv write keeps the
+  # cache consistent, at worst a redundant fetch.
+  if [ "$HAVE_FLOCK" = 1 ]; then
+    ( flock -w 8 9 || { cat "$CACHE" 2>/dev/null; exit 0; }
+      _state_refresh "$fresh"
+    ) 9>"$LOCK"
+  else
+    _state_refresh "$fresh"
+  fi
+}
+
+load_state() {  # sets FIVE, WEEK, FIVE_R, WEEK_R; invalid pct -> empty (that
+  local s       # limit fails open individually); fails if both unusable
+  s=$(cmd_state "${1:-}")
+  [ -n "$s" ] || return 1
+  FIVE=$(jq -r '.five_pct // empty' <<<"$s" 2>/dev/null); FIVE=${FIVE%%.*}
+  WEEK=$(jq -r '.week_pct // empty' <<<"$s" 2>/dev/null); WEEK=${WEEK%%.*}
+  FIVE_R=$(jq -r '.five_resets // empty' <<<"$s" 2>/dev/null)
+  WEEK_R=$(jq -r '.week_resets // empty' <<<"$s" 2>/dev/null)
+  case "$FIVE" in ''|*[!0-9]*) FIVE="";; esac
+  case "$WEEK" in ''|*[!0-9]*) WEEK="";; esac
+  [ -n "$FIVE" ] || [ -n "$WEEK" ] || return 1
+  return 0
+}
+
+five_ge() { [ -n "$FIVE" ] && [ "$FIVE" -ge "$1" ]; }
+five_lt() { [ -n "$FIVE" ] && [ "$FIVE" -lt "$1" ]; }
+week_ge() { [ -n "$WEEK" ] && [ "$WEEK" -ge "$1" ]; }
+
+sdir() { printf '%s/sessions/%s' "$RUN" "$1"; }
+
+grant_level() {  # $1 sid -> 0/1/2, valid only for the current weekly window
+  local f lvl iso
+  [ -n "${1:-}" ] || { echo 0; return; }
+  f="$(sdir "$1")/grant_week"
+  [ -f "$f" ] || { echo 0; return; }
+  { read -r lvl iso < "$f"; } 2>/dev/null || { echo 0; return; }
+  case "$lvl" in 1|2) ;; *) echo 0; return;; esac
+  if [ -n "$iso" ] && [ -n "$WEEK_R" ] && [ "$iso" = "$WEEK_R" ]; then
+    echo "$lvl"
+  else
+    echo 0
+  fi
+}
+
+flag_once()  { mkdir -p "$(sdir "$1")" 2>/dev/null; mkdir "$(sdir "$1")/$2" 2>/dev/null; }
+flag_clear() { rm -rf "${RUN:?}/sessions/$1/$2"; }
+
+is_guard_cmd() {  # 0 = single clean guard invocation; sets GUARD_SUB.
+  # The command must be exactly `claude-usage-guard <sub> [args]` — no env
+  # prefix (an env var like CUG_FETCH=/x or LD_PRELOAD=/x would change what
+  # runs), no metacharacters, no second command. The hook messages only ever
+  # tell the agent this plain form.
+  local IFS=$' \t\n' c="${1:-}" first sub
+  case "$c" in
+    ''|*$'\n'*|*$'\r'*|*';'*|*'&'*|*'|'*|*'$'*|*'`'*|*'('*|*')'*|*'<'*|*'>'*|*'*'*|*'?'*|*'{'*|*'}'*|*'='*) return 1;;
+  esac
+  read -r first sub _ <<<"$c"
+  case "$first" in claude-usage-guard|*/claude-usage-guard) ;; *) return 1;; esac
+  case "$sub" in
+    grant|wait|status|state|revoke) GUARD_SUB="$sub"; return 0;;
+    *) return 1;;
+  esac
+}
+
+# ---------------------------------------------------------------- messages
+
+msg_week_ask() {  # $1 sid, $2 level (1 = 80% gate, 2 = 95% gate)
+  local sid="$1" opt="" hard="$WEEK_HARD"
+  if [ "$2" = 2 ]; then opt=" --level 2"; hard="$WEEK_HARD2"; fi
+  cat <<EOF
+USAGE GUARD - WEEKLY LIMIT CHECKPOINT. Weekly Claude usage is at ${WEEK}%; the weekly window resets at ${WEEK_R:-unknown} (in $(until_str "$WEEK_R")). Do this now:
+1. Finish only the current small step and write a short handoff note (done / remaining / exact next step).
+2. Ask the user in plain text for permission to keep spending the weekly budget, then end your turn.
+   - If the user says yes, run: claude-usage-guard grant${opt} ${sid}
+     (this shows the user a permission prompt; their approval IS the permission)
+   - If the user says no, or you get no answer, just end your turn. A reset waiter starts automatically and wakes you when the weekly limit resets or permission is granted. Never set up timers, cron jobs, or new sessions instead.
+Never run the grant command without an explicit yes from the user. At ${hard}% weekly, all tools except claude-usage-guard are hard-blocked.
+EOF
+}
+
+msg_week_block() {  # $1 sid, $2 required level
+  local sid="$1" opt="" hard="$WEEK_HARD"
+  if [ "$2" = 2 ]; then opt=" --level 2"; hard="$WEEK_HARD2"; fi
+  cat <<EOF
+USAGE GUARD - TOOL BLOCKED. Weekly Claude usage is ${WEEK}%, at or above the ${hard}% hard stop, without user permission. Do not retry this or other tools. Either:
+- If the user explicitly said yes in this conversation: run claude-usage-guard grant${opt} ${sid} (the user confirms via a permission prompt), or
+- Ask the user for permission in plain text and end your turn, putting any handoff info in your final message. A reset waiter starts automatically and wakes you when the weekly limit resets (at ${WEEK_R:-unknown}, in $(until_str "$WEEK_R")) or permission is granted.
+EOF
+}
+
+msg_five_pause() {
+  cat <<EOF
+USAGE GUARD - 5-HOUR PAUSE. 5-hour Claude usage is at ${FIVE}%; the window resets at ${FIVE_R:-unknown} (in $(until_str "$FIVE_R")). Finish only the current small step, write a short handoff note (done / remaining / exact next step), then end your turn. A reset waiter starts automatically and wakes you when the window resets. Do NOT ask the user for permission (that is only for the weekly limit) and never set up timers, cron jobs, or new sessions. At ${FIVE_HARD}% all tools except claude-usage-guard are hard-blocked.
+EOF
+}
+
+msg_five_block() {
+  cat <<EOF
+USAGE GUARD - TOOL BLOCKED. 5-hour Claude usage is ${FIVE}% (hard stop ${FIVE_HARD}%). Do not retry this or other tools and do not ask the user for permission (that is only for the weekly limit). Put any handoff info in your final message and end your turn. A reset waiter starts automatically and wakes you when the window resets (at ${FIVE_R:-unknown}, in $(until_str "$FIVE_R")).
+EOF
+}
+
+msg_five_warn() {
+  cat <<EOF
+USAGE GUARD - heads-up: 5-hour Claude usage is at ${FIVE}% (resets in $(until_str "$FIVE_R")). Plan to reach a natural stopping point before ${FIVE_PAUSE}%; at ${FIVE_PAUSE}% you will be asked to pause until the reset.
+EOF
+}
+
+# ---------------------------------------------------------------- hooks
+
+emit_pre_deny() {
+  jq -n --arg r "$1" --arg m "$2" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r},systemMessage:$m}'
+}
+
+emit_post_ctx() {
+  jq -n --arg c "$1" --arg m "$2" \
+    '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$c},systemMessage:$m}'
+}
+
+hook_pre() {
+  local input sid tool cmd need glvl
+  input=$(cat)
+  sid=$(sanitize_sid "$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)")
+  tool=$(jq -r '.tool_name // empty' <<<"$input" 2>/dev/null)
+  cmd=$(jq -r '.tool_input.command // empty' <<<"$input" 2>/dev/null)
+
+  # The guard's own commands must stay reachable, or a blocked agent could
+  # never wait/grant its way out. `grant` is routed to a user prompt.
+  if [ "$tool" = "Bash" ] && is_guard_cmd "$cmd"; then
+    if [ "$GUARD_SUB" = "grant" ]; then
+      jq -n '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"ask",permissionDecisionReason:"The agent wants to record YOUR permission to keep spending the weekly Claude budget. Approve only if you really told it to continue."}}'
+    fi
+    exit 0
+  fi
+
+  load_state || exit 0   # fail open
+
+  need=0
+  if week_ge "$WEEK_HARD2"; then need=2
+  elif week_ge "$WEEK_HARD" ; then need=1; fi
+  if [ "$need" -gt 0 ]; then
+    glvl=$(grant_level "$sid")
+    if [ "$glvl" -lt "$need" ]; then
+      emit_pre_deny "$(msg_week_block "$sid" "$need")" \
+        "Usage guard: weekly usage ${WEEK}% - tools blocked pending user permission."
+      exit 0
+    fi
+  fi
+
+  if five_ge "$FIVE_HARD"; then
+    emit_pre_deny "$(msg_five_block)" \
+      "Usage guard: 5-hour usage ${FIVE}% - tools blocked until the window resets."
+    exit 0
+  fi
+  exit 0
+}
+
+sync_flags() {  # $1 sid — re-arm one-shot flags on window rollover / usage drop
+  local lastw=""
+  mkdir -p "$(sdir "$1")"
+  [ -f "$(sdir "$1")/week_window" ] && lastw=$(cat "$(sdir "$1")/week_window" 2>/dev/null)
+  if [ -n "$WEEK_R" ] && [ "$lastw" != "$WEEK_R" ]; then
+    printf '%s\n' "$WEEK_R" > "$(sdir "$1")/week_window"
+    flag_clear "$1" asked_week80; flag_clear "$1" asked_week95
+  fi
+  if five_lt "$FIVE_WARN"; then
+    flag_clear "$1" warned_five80; flag_clear "$1" paused_five90
+  fi
+}
+
+hook_post() {
+  local input sid glvl
+  input=$(cat)
+  sid=$(sanitize_sid "$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)")
+  [ -n "$sid" ] || exit 0
+  load_state || exit 0
+  sync_flags "$sid"
+
+  glvl=$(grant_level "$sid")
+
+  if week_ge "$WEEK_ASK2" && [ "$glvl" -lt 2 ]; then
+    if flag_once "$sid" asked_week95; then
+      emit_post_ctx "$(msg_week_ask "$sid" 2)" \
+        "Usage guard: weekly usage ${WEEK}% - agent must ask for (renewed) permission."
+      exit 0
+    fi
+  elif week_ge "$WEEK_ASK" && [ "$glvl" -lt 1 ]; then
+    if flag_once "$sid" asked_week80; then
+      emit_post_ctx "$(msg_week_ask "$sid" 1)" \
+        "Usage guard: weekly usage ${WEEK}% - agent asked to pause and request permission."
+      exit 0
+    fi
+  fi
+
+  if five_ge "$FIVE_PAUSE"; then
+    if flag_once "$sid" paused_five90; then
+      flag_once "$sid" warned_five80 || true
+      emit_post_ctx "$(msg_five_pause)" \
+        "Usage guard: 5-hour usage ${FIVE}% - agent asked to pause until reset."
+      exit 0
+    fi
+  elif five_ge "$FIVE_WARN"; then
+    if flag_once "$sid" warned_five80; then
+      emit_post_ctx "$(msg_five_warn)" "Usage guard: 5-hour usage ${FIVE}%."
+      exit 0
+    fi
+  fi
+  exit 0
+}
+
+hook_sessionstart() {
+  local input sid ctx glvl
+  input=$(cat)
+  sid=$(sanitize_sid "$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)")
+  load_state || exit 0
+  [ -n "$sid" ] && sync_flags "$sid"
+  five_ge "$FIVE_WARN" || week_ge "$WEEK_ASK" || exit 0
+
+  ctx="USAGE GUARD status at session start: 5-hour usage ${FIVE:-?}% (resets in $(until_str "$FIVE_R")), weekly usage ${WEEK:-?}% (resets in $(until_str "$WEEK_R")). "
+  glvl=$(grant_level "$sid")
+  if week_ge "$WEEK_ASK2" && [ "$glvl" -lt 2 ]; then
+    [ -z "$sid" ] || flag_once "$sid" asked_week95 || true
+    ctx="${ctx}$(msg_week_ask "$sid" 2)"
+  elif week_ge "$WEEK_ASK" && [ "$glvl" -lt 1 ]; then
+    [ -z "$sid" ] || flag_once "$sid" asked_week80 || true
+    ctx="${ctx}$(msg_week_ask "$sid" 1)"
+  elif five_ge "$FIVE_PAUSE"; then
+    if [ -n "$sid" ]; then
+      flag_once "$sid" paused_five90 || true; flag_once "$sid" warned_five80 || true
+    fi
+    ctx="${ctx}$(msg_five_pause)"
+  else
+    ctx="${ctx}Plan work to reach natural stopping points; the guard hooks will instruct you when a threshold is crossed."
+  fi
+  jq -n --arg c "$ctx" \
+    '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'
+  exit 0
+}
+
+# One waiter per session. With flock the kernel releases the lock even on
+# SIGKILL. Without flock (macOS) we fall back to an atomic mkdir lock plus a
+# PID file, reclaimed when the recorded holder is dead — so a killed waiter
+# still can't permanently disable resume.
+waiter_acquire() {  # $1 = session dir; 0 if we now hold the waiter lock
+  local lock="$1/waiter.lock" opid
+  mkdir -p "$1"
+  if [ "$HAVE_FLOCK" = 1 ]; then
+    exec 8>"$lock"; flock -n 8; return
+  fi
+  mkdir "$lock" 2>/dev/null && { printf '%s' "$$" > "$lock/pid"; return 0; }
+  opid=$(cat "$lock/pid" 2>/dev/null || true)
+  [ -n "$opid" ] && kill -0 "$opid" 2>/dev/null && return 1
+  rm -rf "$lock"                                            # holder dead: reclaim
+  mkdir "$lock" 2>/dev/null && { printf '%s' "$$" > "$lock/pid"; return 0; }
+  return 1
+}
+waiter_release() {  # $1 = session dir
+  if [ "$HAVE_FLOCK" = 1 ]; then exec 8>&- 2>/dev/null; rm -f "$1/waiter.lock" 2>/dev/null
+  else rm -rf "$1/waiter.lock" 2>/dev/null; fi
+}
+
+# Stop hook (configured with asyncRewake): if the session ends its turn while
+# a pause is active, wait in the background and wake the agent (exit 2).
+hook_stop() {
+  local input sid glvl scope=""
+  input=$(cat)
+  sid=$(sanitize_sid "$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)")
+  [ -n "$sid" ] || exit 0
+  load_state || exit 0
+  glvl=$(grant_level "$sid")
+  if week_ge "$WEEK_ASK2" && [ "$glvl" -lt 2 ]; then scope=week
+  elif week_ge "$WEEK_ASK" && [ "$glvl" -lt 1 ]; then scope=week
+  elif five_ge "$FIVE_PAUSE"; then scope=five
+  fi
+  [ -n "$scope" ] || exit 0
+
+  waiter_acquire "$(sdir "$sid")" || exit 0
+  trap 'waiter_release "$(sdir "$sid")"' EXIT
+
+  if wait_loop "$scope" "$sid" >&2; then
+    echo "USAGE GUARD (auto-waiter): the pause is over - the $scope limit reset or the user granted permission. Re-read your handoff note and continue the paused task." >&2
+    exit 2
+  fi
+  exit 0
+}
+
+# ---------------------------------------------------------------- commands
+
+wait_loop() {  # $1 scope, $2 sid
+  local scope="$1" sid="${2:-}" thr target cap now started fresh iso pct new_target need gm
+  case "$scope" in
+    five) thr="$FIVE_PAUSE";;
+    week) thr="$WEEK_ASK";;
+    *) return 1;;
+  esac
+  pick() { if [ "$scope" = five ]; then iso="$FIVE_R"; pct="$FIVE"; else iso="$WEEK_R"; pct="$WEEK"; fi; }
+
+  if ! load_state; then
+    echo "Usage data unavailable; waiting 30 minutes blind."
+    sleep 1800 8>&-   # fd 8 = waiter flock; children must not inherit it
+    return 0
+  fi
+  pick
+  started=$(date +%s)
+  target=$(epoch "$iso") || target=$(( started + 3600 ))
+  if [ "$scope" = five ]; then cap=$(( started + 8*3600 )); else cap=$(( started + 8*86400 )); fi
+
+  echo "Usage guard: waiting for the $scope limit (now ${pct:-?}%) to reset at ${iso:-unknown} (in $(until_str "$iso"))."
+  while :; do
+    now=$(date +%s)
+    if [ "$scope" = week ] && [ -n "$sid" ]; then
+      # Wake as soon as the current grant satisfies what the pre-hook would
+      # require at the CURRENT percentage (level 2 only from the top gate).
+      need=1; week_ge "$WEEK_HARD2" && need=2
+      if [ "$(grant_level "$sid")" -ge "$need" ]; then
+        echo "Usage guard: the user granted permission."
+        return 0
+      fi
+    fi
+    if [ -n "$pct" ] && [ "$pct" -lt "$thr" ]; then
+      echo "Usage guard: $scope usage is now ${pct}%, below ${thr}%. The limit has reset."
+      return 0
+    fi
+    # Grace fallback: reset time long past but usage data never confirmed it.
+    # Never before one sleep + one fresh fetch, and only once per reset target
+    # (marker), so stale data cannot cause an instant wake/stop/wake loop.
+    if [ "$now" -gt $(( target + 1800 )) ] && [ $(( now - started )) -ge 90 ]; then
+      if [ -n "$sid" ]; then
+        gm="$(sdir "$sid")/grace_$scope"
+        [ -f "$gm" ] && [ "$(cat "$gm" 2>/dev/null)" = "$target" ] && return 1
+        mkdir -p "$(sdir "$sid")"; printf '%s' "$target" > "$gm"
+      fi
+      echo "Usage guard: the $scope reset time passed over 30 minutes ago without confirmation from usage data. Assuming reset (hooks will re-block if it is still exceeded)."
+      return 0
+    fi
+    [ "$now" -gt "$cap" ] && return 1
+    sleep 60 8>&-     # fd 8 = waiter flock; children must not inherit it
+    fresh=""
+    [ "$(date +%s)" -ge "$target" ] && fresh="--fresh"
+    if load_state "$fresh"; then
+      pick
+      new_target=$(epoch "$iso") && [ -n "$new_target" ] && target="$new_target"
+    fi
+  done
+}
+
+cmd_wait() {
+  local scope="${1:-}" sid
+  sid=$(sanitize_sid "${2:-}")
+  case "$scope" in five|week) ;; *)
+    echo "usage: claude-usage-guard wait <five|week> [session_id]" >&2; exit 2;;
+  esac
+  if wait_loop "$scope" "$sid"; then
+    echo "USAGE GUARD: the pause is over. Resume the paused task: re-read your handoff note and continue."
+    exit 0
+  fi
+  echo "USAGE GUARD: wait safety cap reached; giving up. Run claude-usage-guard status manually." >&2
+  exit 1
+}
+
+cmd_grant() {
+  local level=1 sid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --level) level="${2:-}"; shift 2 || exit 2;;
+      -*) echo "unknown option: $1" >&2; exit 2;;
+      *) sid="$1"; shift;;
+    esac
+  done
+  sid=$(sanitize_sid "$sid")
+  [ -n "$sid" ] || { echo "usage: claude-usage-guard grant [--level 1|2] <session_id>" >&2; exit 2; }
+  case "$level" in 1|2) ;; *) echo "level must be 1 or 2" >&2; exit 2;; esac
+  load_state || { echo "cannot read current usage; grant not recorded" >&2; exit 1; }
+  [ -n "$WEEK_R" ] || { echo "cannot record grant: weekly reset time unknown; try again later" >&2; exit 1; }
+  mkdir -p "$(sdir "$sid")"
+  printf '%s %s\n' "$level" "$WEEK_R" > "$(sdir "$sid")/grant_week"
+  echo "Recorded user permission (level $level) for session $sid."
+  echo "Valid until the weekly window resets at $WEEK_R (in $(until_str "$WEEK_R"))."
+}
+
+cmd_status() {
+  local d g
+  load_state || { echo "usage data unavailable" >&2; exit 1; }
+  echo "5-hour: ${FIVE:-?}%  (warn ${FIVE_WARN} / pause ${FIVE_PAUSE} / block ${FIVE_HARD})  resets ${FIVE_R:-unknown} (in $(until_str "$FIVE_R"))"
+  echo "weekly: ${WEEK:-?}%  (ask ${WEEK_ASK} / block ${WEEK_HARD} / re-ask ${WEEK_ASK2} / block ${WEEK_HARD2})  resets ${WEEK_R:-unknown} (in $(until_str "$WEEK_R"))"
+  for d in "$RUN/sessions"/*/; do
+    [ -d "$d" ] || continue
+    g="${d}grant_week"
+    [ -f "$g" ] && echo "grant: ${g#"$RUN/sessions/"} -> $(cat "$g")"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- dispatch
+
+case "${1:-}" in
+  state)  shift; cmd_state "${1:-}";;
+  status) cmd_status;;
+  grant)  shift; cmd_grant "$@";;
+  revoke)
+    sid=$(sanitize_sid "${2:-}")
+    [ -n "$sid" ] || { echo "usage: claude-usage-guard revoke <session_id>" >&2; exit 2; }
+    rm -f "$(sdir "$sid")/grant_week"
+    echo "Weekly grant revoked for session $sid."
+    ;;
+  wait)   shift; cmd_wait "$@";;
+  hook)
+    case "${2:-}" in
+      pre)          hook_pre;;
+      post)         hook_post;;
+      sessionstart) hook_sessionstart;;
+      stop)         hook_stop;;
+      *) exit 0;;
+    esac
+    ;;
+  *)
+    sed -n '2,37p' "$0" | grep -E '^# ?' | sed 's/^# \{0,1\}//' >&2
+    exit 2
+    ;;
+esac
